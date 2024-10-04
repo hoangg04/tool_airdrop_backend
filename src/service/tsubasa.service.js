@@ -54,18 +54,25 @@ class TsubasaService {
         "x-player-id": playerId,
       }
     })
-    response.status === 200 && console.log("Claim daily", TsubasaService.thread[userId][botId].name);
+    if (response.status === 200) console.log("Claim daily", TsubasaService.thread[userId][botId].name);
+    else console.log("Claim daily failed", TsubasaService.thread[userId][botId].name);
     return response.status === 200 ? true : false
   }
   static async upgradeCard({ userId, playerId, botId, bot_init_data, axiosInstance }) {
     if (!userId || !axiosInstance) {
-      throw new BadRequestError("Missing userId or axiosInstance");
+      return {
+        success: false,
+        user: null,
+        message: "Missing userId or axiosInstance"
+      }
     }
     const cardCanUpgrade = TsubasaService.thread[userId][botId].cardAvailable.shift();
     if (Date.now() < cardCanUpgrade.level_up_available_date * 1000 + 360000) {
       console.log("Card can't upgrade because it in lock time", cardCanUpgrade.id);
+      TsubasaService.thread[userId][botId].cardInLockTime.push(cardCanUpgrade);
       return {
         success: false,
+        user: null,
         message: "Card is in lock time"
       }
     }
@@ -74,14 +81,11 @@ class TsubasaService {
       // switch bot from upgrade into idle
       return {
         success: false,
+        user: null,
         message: "Not enough coin"
       }
-    } else {
-      TsubasaService.thread[userId][botId].status = 0;
-      // switch bot form idle to upgrade
     }
     try {
-
       const response = await axiosInstance.post('https://app.ton.tsubasa-rivals.com/api/card/levelup', {
         card_id: cardCanUpgrade.id,
         category_id: cardCanUpgrade.category,
@@ -101,13 +105,11 @@ class TsubasaService {
           TsubasaService.thread[userId][botId].cardAvailable.push(response.data.update.card)
         }
         if (TsubasaService.thread[userId][botId].levelOfCard[response.data.update.card.id]) {
-
-          TsubasaService.thread[userId][botId].levelOfCard[response.data.update.card.id] = TsubasaService.thread[userId][botId].levelOfCard[response.data.update.card.id].filter(c => {
-            if (response.data.update.card.level >= c.unlock_card_level && !c.level_up_available_date) {
-              TsubasaService.thread[userId][botId].cardAvailable.push(c);
-            }
-            return response.data.update.card.level < c.unlock_card_level
-          });
+          const c = TsubasaService.thread[userId][botId].levelOfCard[response.data.update.card.id][0]
+          if (response.data.update.card.level >= c.unlock_card_level && !c.level_up_available_date) {
+            TsubasaService.thread[userId][botId].cardAvailable.push(c);
+            delete TsubasaService.thread[userId][botId].levelOfCard[response.data.update.card.id]
+          }
         }
 
         TsubasaService.thread[userId][botId].cardInLockTime = TsubasaService.thread[userId][botId].cardInLockTime.filter(card => {
@@ -118,12 +120,11 @@ class TsubasaService {
           return true;
         });
 
-        TsubasaService.thread[userId][botId].cardAvailable.sort((a, b) => {
-          return a.cost - b.cost
-        })
+
         return {
           success: true,
           user: response.data.game_data.user,
+          message: "Card update Done"
         };
       }
       throw BadRequestError("Error when upgrade card");
@@ -135,11 +136,11 @@ class TsubasaService {
   static getCardCanUpdate({ userId, botId, card_info }) {
     card_info.forEach(info => {
       info.card_list.forEach(card => {
-        if (card.unlocked && card.level_up_available_date * 1000 <= Date.now()) {
+        if (card.unlocked && card.level_up_available_date * 1000 < Date.now()) {
           TsubasaService.thread[userId][botId].cardAvailable.push({ ...card });
         } else {
-          if (card.unlock_card_id !== "Friend") {
-            if (!TsubasaService.thread[userId][botId].levelOfCard[card.unlock_card_id]) {
+          if (!card.unlocked && card.unlock_card_id && card.unlock_card_id !== "Friend") {
+            if (!TsubasaService.thread[userId][botId].levelOfCard[card.unlock_card_id] && card.level <= 15) {
               TsubasaService.thread[userId][botId].levelOfCard[card.unlock_card_id] = [card]
             } else {
               TsubasaService.thread[userId][botId].levelOfCard[card.unlock_card_id].push(card);
@@ -150,9 +151,6 @@ class TsubasaService {
           TsubasaService.thread[userId][botId].cardInLockTime.push(card);
         }
       })
-    })
-    TsubasaService.thread[userId][botId].cardAvailable.sort((a, b) => {
-      return a.cost - b.cost;
     })
   }
 
@@ -256,50 +254,56 @@ class TsubasaService {
       axiosInstance
     })
     TsubasaService.getCardCanUpdate({ userId, botId, card_info: data.card_info });
-    if (data.user.total_coins < TsubasaService.thread[userId][botId].cardAvailable[0].cost) {
-      TsubasaService.thread[userId][botId].status = 1;
-    }
+
     async function loopTask() {
       let currentTime = Date.now() / 1000;
-      if (TsubasaService.thread[userId][botId].status == 1) {
-        if (currentTime > TsubasaService.thread[userId][botId].next_claim) {
-          await TsubasaService.claimDaily({ userId, botId, axiosInstance });
-          TsubasaService.thread[userId][botId].next_claim += 24 * 60 * 60;
-        }
+      if (currentTime > TsubasaService.thread[userId][botId].next_claim) {
+        await TsubasaService.claimDaily({ userId, botId, axiosInstance, playerId: data.user.id });
+        TsubasaService.thread[userId][botId].next_claim += 24 * 60 * 60;
       }
-      if (TsubasaService.thread[userId][botId].status === 0) {
-        while (TsubasaService.thread[userId][botId].status === 0) {
-          const newData = await TsubasaService.upgradeCard({
-            userId: userId,
-            playerId: data.user.id,
-            botId: botId,
-            bot_init_data,
-            axiosInstance
-          })
 
-          if (typeof (newData) === "object" && newData.hasOwnProperty("user")) {
-            TsubasaService.thread[userId][botId].total_coins = newData.user.total_coins;
-            await botModel.findOneAndUpdate({
-              _id: botId
-            }, {
-              bot_data: {
-                ...newData.user
-              }
-            })
+      while (TsubasaService.thread[userId][botId].status === 0) {
+        TsubasaService.thread[userId][botId].cardAvailable.sort((a, b) => {
+          const aInD = a.id in TsubasaService.thread[userId][botId].levelOfCard;
+          const bInD = b.id in TsubasaService.thread[userId][botId].levelOfCard;
+          if (aInD && !bInD) return -1;
+          if (!aInD && bInD) return 1;
+          if (aInD && bInD) {
+            return TsubasaService.thread[userId][botId].cardAvailable.findIndex(item => item.id === a.id) - TsubasaService.thread[userId][botId].cardAvailable.findIndex(item => item.id === b.id);
           }
-          await new Promise(resolve => {
-            setTimeout(() => {
-              resolve();
-            }, 10000);
-          })
-        }
-      } else {
+          return a.cost - b.cost;
+        })
+        const newData = await TsubasaService.upgradeCard({
+          userId: userId,
+          playerId: data.user.id,
+          botId: botId,
+          bot_init_data,
+          axiosInstance
+        })
+
+        if (typeof (newData) !== "object" || !newData.user) break;
+        TsubasaService.thread[userId][botId].total_coins = newData.user.total_coins;
+        await botModel.findOneAndUpdate({
+          _id: botId
+        }, {
+          bot_data: {
+            ...newData.user
+          }
+        })
+        await new Promise(resolve => {
+          setTimeout(() => {
+            resolve();
+          }, 5000);
+        })
+      }
+      if (TsubasaService.thread[userId][botId].status === 1) {
         setTimeout(() => {
-          if (TsubasaService.thread[userId][botId].status === 1) {
+          {
             TsubasaService.thread[userId][botId].status === 0
+            console.log(Date.now(), "Switch idle into upgrading", TsubasaService.thread[userId][botId].name);
             loopTask();
           }
-        }, 1000 * 60 * 60 * 3);
+        }, 1000 * 60 * 60 * 3 * Math.floor(Math.random() * 60));
       }
     }
     loopTask();
